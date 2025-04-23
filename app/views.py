@@ -3,102 +3,136 @@ import time
 import requests
 from rest_framework.response import Response
 from rest_framework.decorators import api_view
-from queue import Queue
 from django.core.cache import cache
+
+from app.kafka import getKafka, sendKafka
+from app.utils import text_to_bits, split_bits, sanitize_topic_name
+
+from queue import Queue
+
+SEGMENT_SIZE_BYTES = 100
+SEGMENT_SIZE_BITS = SEGMENT_SIZE_BYTES * 8
 
 send_queue = Queue()
 
-def pooling(message_id, send_time, total_segments, username):
+
+def ws_sender_worker():
+    while True:
+        task = send_queue.get()
+        if task is None:
+            break
+
+        username, send_time, message, error = task
+        send_to_ws(username, send_time, message, error)
+        time.sleep(0.5)
+
+
+def send_to_ws(username, send_time, message, error=False):
+    print("send_to_ws")
+
+    earth_resp = requests.post('http://localhost:8010/receive/', json={
+        "username": username,
+        "message": message,
+        "send_time": send_time,
+        "error": error
+    })
+
+    print(earth_resp.status_code)
+
+    mars_resp = requests.post('http://localhost:8020/receive/', json={
+        "username": username,
+        "message": message,
+        "send_time": send_time,
+        "error": error
+    })
+    print(mars_resp.status_code)
+
+
+def pooling(send_time, total_segments, username):
     prev = []
 
     while True:
         time.sleep(3)
 
-        segments = cache.get(message_id)
+        segments = cache.get(send_time)
         if len(prev) != len(segments):
             prev = segments
 
         else:
             if len(segments) != total_segments:
-                send_to_ws(username, send_time, "", error=True)
-                cache.delete(message_id)
+                send_queue.put((username, send_time, "", True))
+                cache.delete(send_time)
             else:
                 try:
                     binary_string = "".join(segments)
                     message = ''.join(chr(int(binary_string[i:i + 8], 2)) for i in range(0, len(binary_string), 8))
                     print("decoded: " + message)
-                    send_to_ws(username, send_time, message)
+                    send_queue.put((username, send_time, message, False))
                 except:
-                    send_to_ws(username, send_time, "", error=True)
+                    send_queue.put((username, send_time, "", True))
                 finally:
-                    cache.delete(message_id)
+                    cache.delete(send_time)
 
             break
 
-def start_sender_thread():
-    sender_thread = threading.Thread(target=rate_limited_sender)
-    sender_thread.daemon = True
-    sender_thread.start()
 
-start_sender_thread()
+def assembling(segments_count, send_time, username):
+    print("Сборка сегментов сообщения с временем отправки " + send_time)
 
-def rate_limited_sender():
-    while True:
-        time.sleep(0.5)
+    segments = getKafka(sanitize_topic_name(send_time))
+    print(segments_count)
+    print(len(segments))
+    if segments_count == len(segments):
+        for i, segment in enumerate(segments):
+            print(f"Отправка сегмента №{i + 1} на канальный уровень")
+            resp = requests.post('http://localhost:8001/code/', json={
+                "segment": segment,
+                "segment_number": i,
+                "total_segments": len(segments),
+                "send_time": send_time,
+                "username": username
+            })
 
-        segment_data = send_queue.get()
+            print(resp.status_code)
 
-        if segment_data is None:
-            break
-
-        response = requests.post('http://localhost:8001/code/', json=segment_data)
-
-        if response.status_code != 200:
-            print(f"Ошибка при отправке сегмента: {response.status_code}")
-        else:
-            print(f"Сегмент отправлен успешно: {segment_data['segment_number']}")
+            time.sleep(1)
 
 
 @api_view(["POST"])
 def send(request):
     message = request.data.get('message')
-    message_bytes = message.encode("utf-8")
-    total_segments = (len(message_bytes) + 99) // 100
-
     username = request.data.get('username')
     send_time = request.data.get('send_time')
 
-    for i in range(0, len(message_bytes), 100):
-        chunk = message_bytes[i:i + 100]
-        segment_data = {
-            "segment": chunk.decode("utf-8", errors="ignore"),
-            "segment_number": i // 100 + 1,
-            "total_segment": total_segments,
-            "send_time": send_time,
-            "username": username
-        }
+    bitstring = text_to_bits(message)
+    segments = split_bits(bitstring, SEGMENT_SIZE_BITS)
 
-        send_queue.put(segment_data)
+    for i, segment in enumerate(segments):
+        print(f"Отправка сегмента в кафку №{i + 1}")
+        sendKafka(segment, sanitize_topic_name(send_time))
+
+    threading.Thread(target=assembling, args=[len(segments), send_time, username]).start()
 
     return Response({"message": "OK"}, status=200)
 
+
 @api_view(["POST"])
 def transfer(request):
-    message_id = request.data.get('message_id')
     segment = request.data["segment"]
-    segment_number = request.data["segment_number"]
     send_time = request.data["send_time"]
     total_segments = request.data["total_segment"]
     username = request.data["username"]
 
-
-    if message_id in cache:
-        cached_message = cache.get(message_id)
-        cache.set(message_id, cached_message + [segment])
+    if send_time in cache:
+        cached_message = cache.get(send_time)
+        cache.set(send_time, cached_message + [segment])
     else:
-        cache.set(message_id, [segment])
-        threading.Thread(target=pooling, args=[message_id, send_time, total_segments, username]).start()
+        cache.set(send_time, [segment])
+        threading.Thread(target=pooling, args=[send_time, total_segments, username]).start()
 
-    print(cache.get(message_id))
+    print(cache.get(send_time))
 
     return Response({"message": "OK"}, status=200)
+
+
+threading.Thread(target=ws_sender_worker, daemon=True).start()
