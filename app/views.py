@@ -80,14 +80,21 @@ def assembling(segments_count, send_time, username):
     print("Сборка сегментов сообщения с временем отправки " + send_time)
 
     segments = getKafka(sanitize_topic_name(send_time))
-    print(segments_count)
-    print(len(segments))
+
     if segments_count == len(segments):
         for i, segment in enumerate(segments):
             print(f"Отправка сегмента №{i + 1} на канальный уровень")
-            resp = requests.post('http://localhost:8001/code/', json={
+            print({
                 "segment": segment,
-                "segment_number": i,
+                "segment_number": i + 1,
+                "total_segments": len(segments),
+                "send_time": send_time,
+                "username": username
+            })
+
+            resp = requests.post('http://localhost:8001/code', json={
+                "segment": segment,
+                "segment_number": i + 1,
                 "total_segments": len(segments),
                 "send_time": send_time,
                 "username": username
@@ -118,9 +125,10 @@ def send(request):
 
 @api_view(["POST"])
 def transfer(request):
+    print(f"с канального уровня: {request.data}")
     segment = request.data["segment"]
     send_time = request.data["send_time"]
-    total_segments = request.data["total_segment"]
+    total_segments = request.data["total_segments"]
     username = request.data["username"]
 
     if send_time in cache:
@@ -129,8 +137,6 @@ def transfer(request):
     else:
         cache.set(send_time, [segment])
         threading.Thread(target=pooling, args=[send_time, total_segments, username]).start()
-
-    print(cache.get(send_time))
 
     return Response({"message": "OK"}, status=200)
 
