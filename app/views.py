@@ -6,7 +6,7 @@ from rest_framework.decorators import api_view
 from django.core.cache import cache
 
 from app.kafka import getKafka, sendKafka
-from app.utils import text_to_bits, split_bits, sanitize_topic_name
+from app.utils import text_to_bits, split_bits, sanitize_topic_name, text_from_bits
 
 from queue import Queue
 
@@ -30,7 +30,7 @@ def ws_sender_worker():
 def send_to_ws(username, send_time, message, error=False):
     print("send_to_ws")
 
-    earth_resp = requests.post('http://localhost:8010/receive/', json={
+    earth_resp = requests.post('http://localhost:8005/receive/', json={
         "username": username,
         "message": message,
         "send_time": send_time,
@@ -39,7 +39,7 @@ def send_to_ws(username, send_time, message, error=False):
 
     print(earth_resp.status_code)
 
-    mars_resp = requests.post('http://localhost:8020/receive/', json={
+    mars_resp = requests.post('http://localhost:8010/receive/', json={
         "username": username,
         "message": message,
         "send_time": send_time,
@@ -65,7 +65,7 @@ def pooling(send_time, total_segments, username):
             else:
                 try:
                     binary_string = "".join(segments)
-                    message = ''.join(chr(int(binary_string[i:i + 8], 2)) for i in range(0, len(binary_string), 8))
+                    message = text_from_bits(binary_string)
                     print("decoded: " + message)
                     send_queue.put((username, send_time, message, False))
                 except:
@@ -81,6 +81,8 @@ def assembling(segments_count, send_time, username):
 
     segments = getKafka(sanitize_topic_name(send_time))
 
+    print("Общее количество сегментов: ", segments_count)
+    print("В кафке: ", len(segments))
     if segments_count == len(segments):
         for i, segment in enumerate(segments):
             print(f"Отправка сегмента №{i + 1} на канальный уровень")
@@ -107,6 +109,7 @@ def assembling(segments_count, send_time, username):
 
 @api_view(["POST"])
 def send(request):
+    print(f"пришедшее сообщение: {request.data}")
     message = request.data.get('message')
     username = request.data.get('username')
     send_time = request.data.get('send_time')
